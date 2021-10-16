@@ -9,6 +9,11 @@ import traceback
 from networktables import NetworkTablesInstance
 import time as tm
 import RPi.GPIO as GPIO
+import json
+from cscore import CameraServer, VideoSource, UsbCamera, MjpegServer
+import threading
+import sys
+
 
 class GripPipeline:
     """
@@ -19,9 +24,9 @@ class GripPipeline:
         """initializes all values to presets or None if need to be set
         """
 
-        self.__hsl_threshold_hue = [50.08633093525181, 90.60068259385665]
-        self.__hsl_threshold_saturation = [100.96762589928056, 255.0]
-        self.__hsl_threshold_luminance = [80.22841726618702, 200.0]
+        self.__hsl_threshold_hue = [65.0, 129.0]
+        self.__hsl_threshold_saturation = [201.0, 255.0]
+        self.__hsl_threshold_luminance = [53.0, 196.0]
 
         self.hsl_threshold_output = None
 
@@ -31,11 +36,11 @@ class GripPipeline:
         self.find_contours_output = None
 
         self.__filter_contours_contours = self.find_contours_output
-        self.__filter_contours_min_area = 57.0
-        self.__filter_contours_min_perimeter = 100.0
-        self.__filter_contours_min_width = 40.0
+        self.__filter_contours_min_area = 3.0
+        self.__filter_contours_min_perimeter = 0.0
+        self.__filter_contours_min_width = 50.0
         self.__filter_contours_max_width = 1000.0
-        self.__filter_contours_min_height = 20.0
+        self.__filter_contours_min_height = 30.0
         self.__filter_contours_max_height = 1000.0
         self.__filter_contours_solidity = [0, 100]
         self.__filter_contours_max_vertices = 1000000.0
@@ -143,12 +148,181 @@ class GripPipeline:
 
 
 
+configFile = "/boot/frc.json"
+
+class CameraConfig: pass
+
+team = None
+server = False
+cameraConfigs = []
+switchedCameraConfigs = []
+cameras = []
+
+def parseError(str):
+    """Report parse error."""
+    print("config error in '" + configFile + "': " + str, file=sys.stderr)
+
+def readCameraConfig(config):
+    """Read single camera configuration."""
+    cam = CameraConfig()
+
+    # name
+    try:
+        cam.name = config["name"]
+    except KeyError:
+        parseError("could not read camera name")
+        return False
+
+    # path
+    try:
+        cam.path = config["path"]
+    except KeyError:
+        parseError("camera '{}': could not read path".format(cam.name))
+        return False
+
+    # stream properties
+    cam.streamConfig = config.get("stream")
+
+    cam.config = config
+
+    cameraConfigs.append(cam)
+    return True
+
+def readSwitchedCameraConfig(config):
+    """Read single switched camera configuration."""
+    cam = CameraConfig()
+
+    # name
+    try:
+        cam.name = config["name"]
+    except KeyError:
+        parseError("could not read switched camera name")
+        return False
+
+    # path
+    try:
+        cam.key = config["key"]
+    except KeyError:
+        parseError("switched camera '{}': could not read key".format(cam.name))
+        return False
+
+    switchedCameraConfigs.append(cam)
+    return True
+
+def readConfig():
+    """Read configuration file."""
+    global team
+    global server
+
+    # parse file
+    try:
+        with open(configFile, "rt", encoding="utf-8") as f:
+            j = json.load(f)
+    except OSError as err:
+        print("could not open '{}': {}".format(configFile, err), file=sys.stderr)
+        return False
+
+    # top level must be an object
+    if not isinstance(j, dict):
+        parseError("must be JSON object")
+        return False
+
+    # team number
+    try:
+        team = j["team"]
+    except KeyError:
+        parseError("could not read team number")
+        return False
+
+    # ntmode (optional)
+    if "ntmode" in j:
+        str = j["ntmode"]
+        if str.lower() == "client":
+            server = False
+        elif str.lower() == "server":
+            server = True
+        else:
+            parseError("could not understand ntmode value '{}'".format(str))
+
+    # cameras
+    try:
+        cameras = j["cameras"]
+    except KeyError:
+        parseError("could not read cameras")
+        return False
+    for camera in cameras:
+        if not readCameraConfig(camera):
+            return False
+
+    # switched cameras
+    if "switched cameras" in j:
+        for camera in j["switched cameras"]:
+            if not readSwitchedCameraConfig(camera):
+                return False
+
+    return True
+
+def startCamera(config):
+    """Start running the camera."""
+    print("Starting camera '{}' on {}".format(config.name, config.path))
+    inst = CameraServer.getInstance()
+    camera = UsbCamera(config.name, config.path)
+    server = inst.startAutomaticCapture(camera=camera, return_server=True)
+
+    camera.setConfigJson(json.dumps(config.config))
+    camera.setConnectionStrategy(VideoSource.ConnectionStrategy.kKeepOpen)
+
+    if config.streamConfig is not None:
+        server.setConfigJson(json.dumps(config.streamConfig))
+
+    return camera
+
+def startSwitchedCamera(config):
+    """Start running the switched camera."""
+    print("Starting switched camera '{}' on {}".format(config.name, config.key))
+    server = CameraServer.getInstance().addSwitchedCamera(config.name)
+
+    def listener(fromobj, key, value, isNew):
+        if isinstance(value, float):
+            i = int(value)
+            if i >= 0 and i < len(cameras):
+              server.setSource(cameras[i])
+        elif isinstance(value, str):
+            for i in range(len(cameraConfigs)):
+                if value == cameraConfigs[i].name:
+                    server.setSource(cameras[i])
+                    break
+
+    NetworkTablesInstance.getDefault().getEntry(config.key).addListener(
+        listener,
+        ntcore.constants.NT_NOTIFY_IMMEDIATE |
+        ntcore.constants.NT_NOTIFY_NEW |
+        ntcore.constants.NT_NOTIFY_UPDATE)
+
+    return server
+
+
+
 
 def main(ntinst):
 
     ledControlPin = 18
-    GPIO.setmode( GPIO.BOARD )
+
+    dutyCycle = 30
+    configFile = "/boot/frc.json"
+
+    GPIO.setmode( GPIO.BCM )
+
     GPIO.setup( ledControlPin, GPIO.OUT )
+    pwm = GPIO.PWM( ledControlPin, 150 )
+    pwm.start( 0 )
+    pwm.ChangeDutyCycle( dutyCycle )
+
+
+
+
+    #cam = readCameraConfig( camConfig )
+    #startCamera( cam )
 
     cs = CameraServer.getInstance()
 
@@ -162,16 +336,23 @@ def main(ntinst):
     width  = 320
     height = 240
 
-    camera = cs.startAutomaticCapture()
-    camera.setResolution(width, height)
+
+
+
+
+    #camera = cs.startAutomaticCapture()
+    #camera.set
+    #camera.setResolution(width, height)
     # Get a CvSink. This will capture images from the camera
-    camera.setExposureManual(10); 
-    camera.setWhiteBalanceManual(10000); 
+    #camera.setExposureManual(10); 
+    #camera.getProperty( 'saturation' ).set( 100 )
+
+    #print( camera.getConfigJson() )  
 
     cvSink = cs.getVideo()
     # (optional) Setup a CvSource. This will send images back to the Dashboard
 
-    #outputStream = cs.putVideo("Name", width, height)
+    outputStream = cs.putVideo("Name", width, height)
     # Allocating new images is very expensive, always try to preallocate
 
     pipeline = GripPipeline()
@@ -196,33 +377,11 @@ def main(ntinst):
     lastLedTime = tm.time()
     ledOn = False
 
-    GPIO.output( ledControlPin, GPIO.HIGH )
     while True:
+      #tm.sleep(1000)
+      #continue
 
       try:
-          if ledStateTable.getNumber( 'val', 0 ) > 0:
-             GPIO.output( ledControlPin, GPIO.HIGH )
-          else:
-             GPIO.output( ledControlPin, GPIO.LOW )
-
-
-         #currentLoopTime = tm.time()
-         #loopTimes[idx] = currentLoopTime - lastLoopTime
-         #lastLoopTime = currentLoopTime
-
-         #if ( currentLoopTime - lastLedTime ) > 2.0:
-         #   if ledOn:
-         #      GPIO.output( ledControlPin, GPIO.LOW )
-         #      ledOn = False
-         #   else:
-         #      GPIO.output( ledControlPin, GPIO.HIGH )
-         #      ledOn = True
-         #   lastLedTime = currentLoopTime
-
-
-          #print('Frame Loop')
-          # Tell the CvSink to grab a frame from the camera and put it
-          # in the source image. If there is an error notify the output.
           beforeGrab =  tm.time()
           time, img = cvSink.grabFrame(img)
           afterGrab =  tm.time()
@@ -230,7 +389,7 @@ def main(ntinst):
               xCoordTable.putNumber( 'xVal', -1 )
               xCoordTable.putNumber( 'yVal', -1 )
               # Send the output the error.
-              #outputStream.notifyError(cvSink.getError());
+              outputStream.notifyError(cvSink.getError());
               # skip the rest of the current iteration
               continue
 
@@ -238,16 +397,39 @@ def main(ntinst):
           pipeline.process( img ) 
           afterProcess =  tm.time()
 
-          if len( pipeline.filter_contours_output ) > 0:
-              #print( pipeline.filter_contours_output )
+          #grabTimes[idx]    = afterGrab - beforeGrab
+          #processTimes[idx] = afterProcess - afterGrab
 
+          #idx += 1
+
+          #cv2.drawContours( pipeline.hsl_threshold_output, pipeline.filter_contours_output, -1, (0, 255, 0), 3 )
+          print( 'contours:', len( pipeline.filter_contours_output ) )
+          if len( pipeline.filter_contours_output ) > 0:
+
+              if True:
+                cv2.drawContours( 
+                    img, 
+                    pipeline.filter_contours_output, 
+                    -1, 
+                    (0, 0, 255),
+                    3 
+                )
               #print( len(pipeline.find_contours_output) )
               try:
+                  #print( len(pipeline.find_contours_output) )
                   #print( pipeline.filter_contours_output )
                   rect = cv2.minAreaRect( pipeline.find_contours_output[0] )
 
                   box = cv2.boxPoints(rect)
                   box2 = numpy.int0( box )
+                  #print( rect  )
+                  #print( box   )
+                  #print( 'Orig' )
+                  #print( box2  )
+                  #print( type( box2[0][0] ) )
+                  #print( dir( xCoordValue ) )
+                  #xCoordValue.putNumber( ( rect[0] + rect[2] ) / 2 )
+
 
                   rect = cv2.boundingRect( pipeline.filter_contours_output[0] )
                   box  = ( (           float(rect[0]),           float(rect[1]) ), 
@@ -258,17 +440,19 @@ def main(ntinst):
                   box2 = numpy.int0( box )
 
                   #print( 'rect: {}'.format( box2 ) )
-                  print( box2[0][0] )
-                  print( box2[2][0] )
+                  #print( box2[0][0] )
+                  #print( box2[2][0] )
+
+
 
                   numToPut = ( box2[0][0] + box2[2][0] ) / 2
-                  print( 'numToPut: {}'.format( numToPut ) )
+                  #print( 'numToPut: {}'.format( numToPut ) )
                   xCoordTable.putNumber( 'xVal', numToPut )
 
-                  numToPut = ( box2[0][1] + box2[2][1] ) / 2
-                  xCoordTable.putNumber( 'yVal', numToPut )
+                  numToPut2 = ( box2[0][1] + box2[2][1] ) / 2
+                  xCoordTable.putNumber( 'yVal', numToPut2 )
 
-
+                  print('found:',numToPut,numToPut2)
                   #print( type( rect ) )
                   #print( type( box ) )
 
@@ -278,27 +462,6 @@ def main(ntinst):
                   #print( box2 )
                   #print( type( box2[0][0] ) )
 
-                  if False:
-                    cv2.drawContours(img,[box2],0,(0,0,255),2)
-                    cv2.line(
-                        img,
-                        ( int(rect[0] + rect[2] / 2), int(0) ),
-                        ( int(rect[0] + rect[2] / 2), int(height) ),
-                        (0, 255, 255),
-                        int(3),
-                        int(8),
-                        int(0)
-                    )
-
-                    cv2.line(
-                        img,
-                        ( int(0),     int(rect[1] + rect[3] / 2) ),
-                        ( int(width), int(rect[1] + rect[3] / 2) ),
-                        (0, 255, 255),
-                        int(3),
-                        int(8),
-                        int(0)
-                    )
 
 
 
@@ -310,7 +473,7 @@ def main(ntinst):
 
 
           else:
-
+              print( 'No Contours' )
               xCoordTable.putNumber( 'xVal', -1 )
               xCoordTable.putNumber( 'yVal', -1 )
               center = ( int(width / 2), int(height / 2) )
@@ -326,8 +489,9 @@ def main(ntinst):
 
           #outputStream.putFrame( pipeline.hsl_threshold_output )
 
-          #outputStream.putFrame( img )
+          outputStream.putFrame( img )
       except:
+        print( 'No Contours' )
         xCoordTable.putNumber( 'xVal', -1 )
         xCoordTable.putNumber( 'yVal', -1 )
         print( 'Main try block:' )
@@ -335,16 +499,48 @@ def main(ntinst):
 
 if __name__ == '__main__':
 
+
+    if len(sys.argv) >= 2:
+        configFile = sys.argv[1]
+
+    # read configuration
+    if not readConfig():
+        sys.exit(1)
+
     # start NetworkTables
     ntinst = NetworkTablesInstance.getDefault()
-
-    server = False
-    team = 2227
     if server:
         print("Setting up NetworkTables server")
         ntinst.startServer()
     else:
         print("Setting up NetworkTables client for team {}".format(team))
         ntinst.startClientTeam(team)
+
+    # start cameras
+    for config in cameraConfigs:
+        cameras.append(startCamera(config))
+
+    # start switched cameras
+    #for config in switchedCameraConfigs:
+    #    startSwitchedCamera(config)
+
+
+
+
+
+
+
+
+    # start NetworkTables
+    #ntinst = NetworkTablesInstance.getDefault()
+
+    #server = False
+    #team = 2227
+    #if server:
+    #    print("Setting up NetworkTables server")
+    #    ntinst.startServer()
+    #else:
+    #    print("Setting up NetworkTables client for team {}".format(team))
+    #    ntinst.startClientTeam(team)
 
     main(ntinst)
